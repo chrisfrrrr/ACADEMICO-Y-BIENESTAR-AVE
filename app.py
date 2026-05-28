@@ -82,6 +82,8 @@ def export_db_excel(db: Dict[str, pd.DataFrame]) -> bytes:
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         for name, cols in SHEETS.items():
             df = db.get(name, pd.DataFrame(columns=cols)).copy()
+            if name == "Estudiantes" and (df.empty or len(df.dropna(how="all")) == 0):
+                df = latest_students_from_history(db)
 
             # Asegurar estructura mínima de cada hoja
             for c in cols:
@@ -128,6 +130,60 @@ def append_rows(db: Dict[str, pd.DataFrame], sheet: str, rows: List[Dict]) -> Di
         if col not in new_df.columns:
             new_df[col] = np.nan
     db[sheet] = pd.concat([db.get(sheet, pd.DataFrame(columns=SHEETS[sheet])), new_df[SHEETS[sheet]]], ignore_index=True)
+    return db
+
+
+def latest_students_from_history(db: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Construye/actualiza la hoja Estudiantes con el último registro conocido de cada estudiante.
+    Esto evita que el Excel exportado parezca vacío cuando el análisis ya fue registrado
+    en Historial_Estudiantes, pero todavía no existía una base maestra cargada.
+    """
+    hist = db.get("Historial_Estudiantes", pd.DataFrame()).copy()
+    if hist.empty:
+        return pd.DataFrame(columns=SHEETS["Estudiantes"])
+    for col in SHEETS["Historial_Estudiantes"]:
+        if col not in hist.columns:
+            hist[col] = np.nan
+    hist["fecha_sort"] = pd.to_datetime(hist.get("fecha"), errors="coerce")
+    keys = []
+    if "carne" in hist.columns and hist["carne"].notna().any():
+        keys = ["carne"]
+    elif "canvas_user_id" in hist.columns and hist["canvas_user_id"].notna().any():
+        keys = ["canvas_user_id"]
+    else:
+        keys = ["correo"]
+    latest = hist.sort_values("fecha_sort").drop_duplicates(keys, keep="last")
+    out = pd.DataFrame(columns=SHEETS["Estudiantes"])
+    for c in SHEETS["Estudiantes"]:
+        if c in latest.columns:
+            out[c] = latest[c]
+        else:
+            out[c] = np.nan
+    return out[SHEETS["Estudiantes"]].reset_index(drop=True)
+
+
+def upsert_students_from_analysis(db: Dict[str, pd.DataFrame], analyzed: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """Actualiza la hoja Estudiantes con los alumnos del análisis activo sin duplicarlos."""
+    if analyzed is None or analyzed.empty:
+        return db
+    current = db.get("Estudiantes", pd.DataFrame(columns=SHEETS["Estudiantes"])).copy()
+    for c in SHEETS["Estudiantes"]:
+        if c not in current.columns:
+            current[c] = np.nan
+    incoming = pd.DataFrame(columns=SHEETS["Estudiantes"])
+    for c in SHEETS["Estudiantes"]:
+        incoming[c] = analyzed[c] if c in analyzed.columns else np.nan
+    incoming = incoming[SHEETS["Estudiantes"]].copy()
+    # Clave preferida: carne; si no hay carné, usar canvas_user_id; si no, correo.
+    combined = pd.concat([current[SHEETS["Estudiantes"]], incoming], ignore_index=True)
+    combined = combined.replace({"": np.nan})
+    if combined["carne"].notna().any():
+        combined["_key"] = combined["carne"].fillna(combined["canvas_user_id"]).fillna(combined["correo"]).astype(str)
+    else:
+        combined["_key"] = combined["canvas_user_id"].fillna(combined["correo"]).fillna(combined["nombre"]).astype(str)
+    combined = combined[combined["_key"].astype(str).str.strip().ne("")]
+    combined = combined.drop_duplicates("_key", keep="last").drop(columns=["_key"])
+    db["Estudiantes"] = combined[SHEETS["Estudiantes"]].reset_index(drop=True)
     return db
 
 # -----------------------------------------------------------------------------
@@ -726,7 +782,12 @@ with tabs[1]:
 
     st.markdown("### Vista previa de la base actual")
     selected_sheet = st.selectbox("Hoja para revisar", list(SHEETS.keys()))
-    st.dataframe(st.session_state.db.get(selected_sheet, pd.DataFrame()), use_container_width=True, height=320)
+    preview_df = st.session_state.db.get(selected_sheet, pd.DataFrame()).copy()
+    if selected_sheet == "Estudiantes" and (preview_df.empty or len(preview_df.dropna(how="all")) == 0):
+        preview_df = latest_students_from_history(st.session_state.db)
+        if not preview_df.empty:
+            st.info("La hoja Estudiantes se reconstruyó automáticamente desde el último historial registrado.")
+    st.dataframe(preview_df, use_container_width=True, height=320)
 
 # -----------------------------------------------------------------------------
 # Canvas / Datos
@@ -808,6 +869,7 @@ with tabs[2]:
             curso_analisis = st.session_state.selected_canvas_course_name or curso_manual
             analyzed = standardize_analysis_input(raw, st.session_state.db, curso_analisis, semana_analisis, asesor_academico)
             st.session_state.analysis_df = analyzed
+            st.session_state.db = upsert_students_from_analysis(st.session_state.db, analyzed)
             idc = datetime.now().strftime("C%Y%m%d%H%M%S")
             rows = []
             for _, r in analyzed.iterrows():
@@ -837,6 +899,7 @@ with tabs[2]:
                     users = client.course_metrics(course_id, course_name)
                     analyzed = standardize_analysis_input(users, st.session_state.db, course_name, semana_analisis, asesor_academico)
                     st.session_state.analysis_df = analyzed
+                    st.session_state.db = upsert_students_from_analysis(st.session_state.db, analyzed)
                     idc = datetime.now().strftime("C%Y%m%d%H%M%S")
                     rows = []
                     for _, r in analyzed.iterrows():
@@ -976,7 +1039,12 @@ with tabs[6]:
 # -----------------------------------------------------------------------------
 with tabs[7]:
     st.markdown("### Exportar base actualizada")
+    if (st.session_state.db.get("Estudiantes", pd.DataFrame()).empty) and not st.session_state.db.get("Historial_Estudiantes", pd.DataFrame()).empty:
+        st.session_state.db["Estudiantes"] = latest_students_from_history(st.session_state.db)
     bytes_xlsx = export_db_excel(st.session_state.db)
+    est_count = len(st.session_state.db.get("Estudiantes", pd.DataFrame()).dropna(how="all"))
+    hist_count = len(st.session_state.db.get("Historial_Estudiantes", pd.DataFrame()).dropna(how="all"))
+    st.caption(f"Registros a exportar: Estudiantes={est_count} | Historial={hist_count}")
     st.download_button("Descargar base de datos actualizada Excel", bytes_xlsx, file_name="base_datos_seguimiento_ave_actualizada.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     if not st.session_state.analysis_df.empty:
         out = io.BytesIO()
