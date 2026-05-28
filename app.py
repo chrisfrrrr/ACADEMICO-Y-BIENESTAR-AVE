@@ -83,22 +83,44 @@ def load_excel_db(uploaded_file) -> Dict[str, pd.DataFrame]:
 
 
 def export_db_excel(db: Dict[str, pd.DataFrame]) -> bytes:
+    """Exporta la base a Excel evitando fallos por columnas vacías, None, NaN o tipos mixtos."""
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         for name, cols in SHEETS.items():
             df = db.get(name, pd.DataFrame(columns=cols)).copy()
+
+            # Asegurar estructura mínima de cada hoja
             for c in cols:
                 if c not in df.columns:
-                    df[c] = np.nan
-            df = df[cols]
+                    df[c] = ""
+            df = df[cols].copy()
+
+            # Reemplazar valores problemáticos antes de exportar
+            df = df.replace({np.nan: "", None: "", pd.NaT: ""})
             df.to_excel(writer, index=False, sheet_name=name)
+
             workbook = writer.book
             ws = writer.sheets[name]
             header_fmt = workbook.add_format({"bold": True, "bg_color": "#0B1F3A", "font_color": "#FFFFFF", "border": 1})
             body_fmt = workbook.add_format({"text_wrap": True, "valign": "top"})
+
             for i, col in enumerate(df.columns):
                 ws.write(0, i, col, header_fmt)
-                width = min(max(12, int(df[col].astype(str).str.len().quantile(.75) if len(df) else len(col)) + 3), 36)
+
+                # Cálculo seguro del ancho de columna. Evita ValueError cuando quantile devuelve NaN.
+                try:
+                    if len(df) > 0:
+                        lengths = df[col].fillna("").astype(str).str.len()
+                        q75 = lengths.quantile(0.75)
+                        if pd.isna(q75):
+                            q75 = len(str(col))
+                        base_width = int(max(q75, len(str(col)))) + 3
+                    else:
+                        base_width = len(str(col)) + 3
+                    width = min(max(12, base_width), 36)
+                except Exception:
+                    width = min(max(12, len(str(col)) + 3), 36)
+
                 ws.set_column(i, i, width, body_fmt)
             ws.freeze_panes(1, 0)
     return output.getvalue()
