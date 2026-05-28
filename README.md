@@ -38,3 +38,9 @@ streamlit run app.py
 - Mensajes_Enviados
 - Consultas_Canvas
 - Configuracion
+
+## Cambios v8
+- Corrección de error de Canvas/Excel: `merge on str and int64 columns for key carne`.
+- Normalización automática de carné, correo, login_id y canvas_user_id como texto.
+- Limpieza de valores leídos desde Excel como `20261234.0` para convertirlos a `20261234`.
+- Mejor compatibilidad al combinar estudiantes obtenidos desde Canvas con bases Excel locales, OneDrive o SharePoint sincronizado.

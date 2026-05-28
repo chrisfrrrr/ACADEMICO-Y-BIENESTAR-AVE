@@ -59,6 +59,41 @@ def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+
+
+def clean_key_value(value):
+    """Normaliza identificadores para evitar errores de merge por tipos mixtos.
+
+    Excel puede leer el carné como número entero, mientras Canvas lo entrega como texto.
+    Esta función convierte ambos casos a texto comparable, preservando vacíos como NaN.
+    """
+    if pd.isna(value):
+        return np.nan
+    txt = str(value).strip()
+    if txt.lower() in ["", "nan", "none", "nat"]:
+        return np.nan
+    # Cuando Excel lee 20261234 como 20261234.0, se limpia el decimal artificial.
+    if re.fullmatch(r"\d+\.0", txt):
+        txt = txt[:-2]
+    return txt
+
+
+def normalize_key_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Convierte claves institucionales y Canvas a texto antes de comparar o fusionar."""
+    df = df.copy()
+    for col in ["carne", "canvas_user_id", "correo", "login_id", "id_asesor"]:
+        if col in df.columns:
+            df[col] = df[col].map(clean_key_value)
+    return df
+
+
+def normalize_db_keys(db: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    """Aplica normalización de claves a todas las hojas de la base."""
+    out = {}
+    for name, df in db.items():
+        out[name] = normalize_key_columns(df) if isinstance(df, pd.DataFrame) else df
+    return out
+
 def load_excel_db(uploaded_file) -> Dict[str, pd.DataFrame]:
     db = empty_db()
     if uploaded_file is None:
@@ -72,8 +107,8 @@ def load_excel_db(uploaded_file) -> Dict[str, pd.DataFrame]:
             for col in SHEETS[key]:
                 if col not in df.columns:
                     df[col] = np.nan
-            db[key] = df[SHEETS[key]]
-    return db
+            db[key] = normalize_key_columns(df[SHEETS[key]])
+    return normalize_db_keys(db)
 
 
 def export_db_excel(db: Dict[str, pd.DataFrame]) -> bytes:
@@ -129,7 +164,8 @@ def append_rows(db: Dict[str, pd.DataFrame], sheet: str, rows: List[Dict]) -> Di
     for col in SHEETS[sheet]:
         if col not in new_df.columns:
             new_df[col] = np.nan
-    db[sheet] = pd.concat([db.get(sheet, pd.DataFrame(columns=SHEETS[sheet])), new_df[SHEETS[sheet]]], ignore_index=True)
+    base = normalize_key_columns(db.get(sheet, pd.DataFrame(columns=SHEETS[sheet])))
+    db[sheet] = normalize_key_columns(pd.concat([base, normalize_key_columns(new_df[SHEETS[sheet]])], ignore_index=True))
     return db
 
 
@@ -138,7 +174,7 @@ def latest_students_from_history(db: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     Esto evita que el Excel exportado parezca vacío cuando el análisis ya fue registrado
     en Historial_Estudiantes, pero todavía no existía una base maestra cargada.
     """
-    hist = db.get("Historial_Estudiantes", pd.DataFrame()).copy()
+    hist = normalize_key_columns(db.get("Historial_Estudiantes", pd.DataFrame()).copy())
     if hist.empty:
         return pd.DataFrame(columns=SHEETS["Estudiantes"])
     for col in SHEETS["Historial_Estudiantes"]:
@@ -166,14 +202,14 @@ def upsert_students_from_analysis(db: Dict[str, pd.DataFrame], analyzed: pd.Data
     """Actualiza la hoja Estudiantes con los alumnos del análisis activo sin duplicarlos."""
     if analyzed is None or analyzed.empty:
         return db
-    current = db.get("Estudiantes", pd.DataFrame(columns=SHEETS["Estudiantes"])).copy()
+    current = normalize_key_columns(db.get("Estudiantes", pd.DataFrame(columns=SHEETS["Estudiantes"])).copy())
     for c in SHEETS["Estudiantes"]:
         if c not in current.columns:
             current[c] = np.nan
     incoming = pd.DataFrame(columns=SHEETS["Estudiantes"])
     for c in SHEETS["Estudiantes"]:
         incoming[c] = analyzed[c] if c in analyzed.columns else np.nan
-    incoming = incoming[SHEETS["Estudiantes"]].copy()
+    incoming = normalize_key_columns(incoming[SHEETS["Estudiantes"]].copy())
     # Clave preferida: carne; si no hay carné, usar canvas_user_id; si no, correo.
     combined = pd.concat([current[SHEETS["Estudiantes"]], incoming], ignore_index=True)
     combined = combined.replace({"": np.nan})
@@ -245,7 +281,7 @@ class CanvasClient:
 
     def users(self, course_id: str) -> pd.DataFrame:
         data = self._get_paginated(f"/courses/{course_id}/users", {"enrollment_type[]": "student"})
-        return pd.DataFrame([{"canvas_user_id": u.get("id"), "nombre": u.get("name"), "correo": u.get("email"), "login_id": u.get("login_id")} for u in data])
+        return normalize_key_columns(pd.DataFrame([{"canvas_user_id": u.get("id"), "nombre": u.get("name"), "correo": u.get("email"), "login_id": u.get("login_id")} for u in data]))
 
     def enrollments(self, course_id: str) -> pd.DataFrame:
         """Obtiene estudiantes con calificación y actividad cuando Canvas lo permite."""
@@ -270,7 +306,7 @@ class CanvasClient:
                 "last_activity_at": last_activity_at,
                 "total_activity_time": e.get("total_activity_time"),
             })
-        return pd.DataFrame(rows)
+        return normalize_key_columns(pd.DataFrame(rows))
 
     def assignments(self, course_id: str) -> pd.DataFrame:
         data = self._get_paginated(f"/courses/{course_id}/assignments", {"include[]": ["submission"]})
@@ -285,16 +321,16 @@ class CanvasClient:
         for s in data:
             u = s.get("user") or {}
             rows.append({"assignment_id": assignment_id, "canvas_user_id": s.get("user_id"), "nombre": u.get("name"), "submitted_at": s.get("submitted_at"), "late": s.get("late"), "missing": s.get("missing"), "score": s.get("score"), "workflow_state": s.get("workflow_state")})
-        return pd.DataFrame(rows)
+        return normalize_key_columns(pd.DataFrame(rows))
 
     def course_metrics(self, course_id: str, course_name: str = "") -> pd.DataFrame:
         """Construye una tabla de seguimiento desde Canvas.
         Intenta leer matrícula, calificaciones, actividades publicadas y entregas.
         Si Canvas no entrega una métrica, se deja como NaN; la lógica de riesgo la tratará como alerta.
         """
-        base = self.enrollments(course_id)
+        base = normalize_key_columns(self.enrollments(course_id))
         if base.empty:
-            base = self.users(course_id)
+            base = normalize_key_columns(self.users(course_id))
         if base.empty:
             return base
 
@@ -342,13 +378,16 @@ class CanvasClient:
             if subs_all and total_actividades > 0:
                 subs = pd.concat(subs_all, ignore_index=True)
                 subs["submitted_flag"] = subs["submitted_at"].notna() | subs["workflow_state"].astype(str).isin(["submitted", "graded"])
-                resumen = subs.groupby("canvas_user_id").agg(
+                subs = normalize_key_columns(subs)
+                base = normalize_key_columns(base)
+                resumen = subs.groupby("canvas_user_id", dropna=False).agg(
                     actividades_entregadas=("submitted_flag", "sum"),
                     entregas_tarde=("late", lambda x: int(pd.Series(x).fillna(False).sum())),
                     entregas_faltantes=("missing", lambda x: int(pd.Series(x).fillna(False).sum())),
                 ).reset_index()
                 resumen["actividades_pct"] = (resumen["actividades_entregadas"] / total_actividades * 100).round(2)
                 resumen["entregas_tarde"] = resumen["entregas_tarde"] + resumen["entregas_faltantes"]
+                resumen = normalize_key_columns(resumen)
                 base = base.merge(resumen[["canvas_user_id", "actividades_pct", "entregas_tarde"]], on="canvas_user_id", how="left")
                 base["actividades_pct"] = base["actividades_pct"].fillna(0)
                 base["entregas_tarde"] = base["entregas_tarde"].fillna(total_actividades)
@@ -541,7 +580,8 @@ def make_derivation_doc(row: pd.Series, asesor_academico: str, asesor_bienestar:
 # Data processing
 # -----------------------------------------------------------------------------
 def standardize_analysis_input(df: pd.DataFrame, db: Dict[str, pd.DataFrame], curso: str, semana: int, asesor: str) -> pd.DataFrame:
-    df = normalize_cols(df)
+    db = normalize_db_keys(db)
+    df = normalize_key_columns(normalize_cols(df))
     aliases = {
         "nombre_del_estudiante": "nombre", "estudiante": "nombre", "sis_user_id": "carne", "id": "carne",
         "mail": "correo", "email": "correo", "score": "promedio", "calificacion": "promedio",
@@ -553,12 +593,15 @@ def standardize_analysis_input(df: pd.DataFrame, db: Dict[str, pd.DataFrame], cu
     for col in ["carne", "nombre", "correo", "telefono", "carrera", "trimestre", "curso", "seccion", "canvas_user_id", "asesor_bienestar", "actividades_pct", "promedio", "entregas_tarde", "semanas_sin_entregas", "ingresos_semana", "dias_inactivo", "horas_respuesta"]:
         if col not in df.columns:
             df[col] = np.nan
+    df = normalize_key_columns(df)
     df["curso"] = df["curso"].fillna(curso)
     df.loc[df["curso"].astype(str).str.strip().eq(""), "curso"] = curso
-    est = db.get("Estudiantes", pd.DataFrame())
+    est = normalize_key_columns(db.get("Estudiantes", pd.DataFrame()))
     if not est.empty and "carne" in df.columns:
+        df = normalize_key_columns(df)
         base_cols = [c for c in ["carne", "telefono", "carrera", "trimestre", "seccion", "asesor_bienestar", "canvas_user_id"] if c in est.columns]
-        df = df.merge(est[base_cols].drop_duplicates("carne"), on="carne", how="left", suffixes=("", "_base"))
+        est_base = normalize_key_columns(est[base_cols].drop_duplicates("carne"))
+        df = df.merge(est_base, on="carne", how="left", suffixes=("", "_base"))
         for c in ["telefono", "carrera", "trimestre", "seccion", "asesor_bienestar", "canvas_user_id"]:
             if f"{c}_base" in df.columns:
                 df[c] = df[c].combine_first(df[f"{c}_base"])
@@ -569,7 +612,7 @@ def standardize_analysis_input(df: pd.DataFrame, db: Dict[str, pd.DataFrame], cu
         risks.append(r); motives.append(m)
     df["riesgo"] = risks
     df["motivo_detectado"] = motives
-    hist = db.get("Historial_Estudiantes", pd.DataFrame())
+    hist = normalize_key_columns(db.get("Historial_Estudiantes", pd.DataFrame()))
     prev_map = {}
     if not hist.empty and "carne" in hist.columns:
         h = hist.dropna(subset=["carne"]).copy()
@@ -611,8 +654,8 @@ def load_excel_db_from_path(path: str) -> Dict[str, pd.DataFrame]:
             for col in SHEETS[key]:
                 if col not in df.columns:
                     df[col] = np.nan
-            db[key] = df[SHEETS[key]]
-    return db
+            db[key] = normalize_key_columns(df[SHEETS[key]])
+    return normalize_db_keys(db)
 
 
 def save_db_to_excel_path(db: Dict[str, pd.DataFrame], path: str, asesor: str = "asesor", make_backup: bool = True) -> Tuple[str, Optional[str]]:
