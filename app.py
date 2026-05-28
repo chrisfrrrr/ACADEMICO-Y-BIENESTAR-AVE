@@ -1,6 +1,7 @@
 import io
 import re
 import zipfile
+from pathlib import Path
 from datetime import datetime, date
 from typing import Dict, List, Optional, Tuple
 
@@ -9,13 +10,6 @@ import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
-
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials
-except Exception:
-    gspread = None
-    Credentials = None
 
 try:
     from docx import Document
@@ -533,120 +527,69 @@ def standardize_analysis_input(df: pd.DataFrame, db: Dict[str, pd.DataFrame], cu
     return df
 
 # -----------------------------------------------------------------------------
-# Google Sheets optional
+# Excel local / sincronizado
 # -----------------------------------------------------------------------------
-def get_gspread_client(json_bytes: Optional[bytes] = None):
-    """Crea cliente de Google Sheets usando JSON subido o st.secrets.
-    En Streamlit Cloud se puede configurar [gcp_service_account] en secrets.toml.
+def load_excel_db_from_path(path: str) -> Dict[str, pd.DataFrame]:
+    """Lee una base Excel desde una ruta accesible para la app.
+
+    Funciona muy bien cuando Streamlit se ejecuta en la computadora del asesor
+    o en un servidor que tenga sincronizada una carpeta de OneDrive/SharePoint/Drive.
     """
-    if gspread is None or Credentials is None:
-        raise RuntimeError("Faltan dependencias. Instalá gspread y google-auth desde requirements.txt.")
-    import json
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-
-    info = None
-    if json_bytes:
-        info = json.loads(json_bytes.decode("utf-8"))
-    else:
-        try:
-            if "gcp_service_account" in st.secrets:
-                info = dict(st.secrets["gcp_service_account"])
-        except Exception:
-            info = None
-
-    if not info:
-        raise ValueError("Subí el archivo JSON de la cuenta de servicio o configurá gcp_service_account en st.secrets.")
-
-    creds = Credentials.from_service_account_info(info, scopes=scopes)
-    return gspread.authorize(creds), info.get("client_email", "")
-
-
-def open_gsheet(spreadsheet_url: str, json_bytes: Optional[bytes] = None):
-    if not spreadsheet_url or not spreadsheet_url.strip():
-        raise ValueError("Ingresá la URL completa de Google Sheets.")
-    gc, service_email = get_gspread_client(json_bytes)
-    try:
-        sh = gc.open_by_url(spreadsheet_url.strip())
-    except Exception as e:
-        raise RuntimeError(
-            "No se pudo abrir el Google Sheets. Verificá que la hoja esté compartida con el correo de la cuenta de servicio "
-            f"({service_email}) con permiso de Editor. Detalle: {e}"
+    if not path or not str(path).strip():
+        raise ValueError("Ingresá la ruta completa del archivo Excel.")
+    path_obj = Path(str(path).strip().strip('\"'))
+    if not path_obj.exists():
+        raise FileNotFoundError(
+            "No se encontró el archivo. Verificá que la ruta exista y que la carpeta sincronizada esté disponible en este equipo."
         )
-    return sh, service_email
+    if path_obj.suffix.lower() not in [".xlsx", ".xlsm"]:
+        raise ValueError("La base debe ser un archivo Excel .xlsx o .xlsm.")
 
-
-def worksheet_to_dataframe(ws, expected_cols: List[str]) -> pd.DataFrame:
-    values = ws.get_all_values()
-    if not values:
-        return pd.DataFrame(columns=expected_cols)
-    headers = [str(h).strip() for h in values[0]]
-    if not any(headers):
-        return pd.DataFrame(columns=expected_cols)
-    data = values[1:]
-    # Ajusta filas con longitud irregular para evitar errores de DataFrame.
-    width = len(headers)
-    data = [(row + [""] * width)[:width] for row in data]
-    df = pd.DataFrame(data, columns=headers)
-    df = normalize_cols(df)
-    for col in expected_cols:
-        if col not in df.columns:
-            df[col] = np.nan
-    return df[expected_cols]
-
-
-def read_gsheet(spreadsheet_url: str, json_bytes: Optional[bytes] = None) -> Dict[str, pd.DataFrame]:
-    sh, _ = open_gsheet(spreadsheet_url, json_bytes)
     db = empty_db()
-    existing = {ws.title: ws for ws in sh.worksheets()}
-    for name, cols in SHEETS.items():
-        if name in existing:
-            db[name] = worksheet_to_dataframe(existing[name], cols)
-        else:
-            # No falla si falta una hoja; solo la crea en memoria vacía.
-            db[name] = pd.DataFrame(columns=cols)
+    xls = pd.ExcelFile(path_obj)
+    for sheet in xls.sheet_names:
+        key = next((s for s in SHEETS if s.lower() == sheet.lower()), sheet)
+        if key in SHEETS:
+            df = pd.read_excel(xls, sheet_name=sheet)
+            df = normalize_cols(df)
+            for col in SHEETS[key]:
+                if col not in df.columns:
+                    df[col] = np.nan
+            db[key] = df[SHEETS[key]]
     return db
 
 
-def init_gsheet(spreadsheet_url: str, json_bytes: Optional[bytes] = None) -> str:
-    """Crea las pestañas requeridas y sus encabezados si no existen."""
-    sh, service_email = open_gsheet(spreadsheet_url, json_bytes)
-    existing = {ws.title: ws for ws in sh.worksheets()}
-    for name, cols in SHEETS.items():
-        if name in existing:
-            ws = existing[name]
-            values = ws.get_all_values()
-            if not values or not any(values[0]):
-                ws.update("A1", [cols])
-        else:
-            rows = max(100, 10)
-            cols_count = max(len(cols), 5)
-            ws = sh.add_worksheet(title=name, rows=rows, cols=cols_count)
-            ws.update("A1", [cols])
-    return service_email
+def save_db_to_excel_path(db: Dict[str, pd.DataFrame], path: str, asesor: str = "asesor", make_backup: bool = True) -> Tuple[str, Optional[str]]:
+    """Guarda la base actual en una ruta local/sincronizada y crea respaldo automático."""
+    if not path or not str(path).strip():
+        raise ValueError("Ingresá la ruta completa donde se guardará el Excel.")
+    path_obj = Path(str(path).strip().strip('\"'))
+    if path_obj.suffix.lower() not in [".xlsx", ".xlsm"]:
+        raise ValueError("La ruta de guardado debe terminar en .xlsx o .xlsm.")
+    path_obj.parent.mkdir(parents=True, exist_ok=True)
+
+    backup_path = None
+    if make_backup and path_obj.exists():
+        safe_asesor = re.sub(r"[^A-Za-z0-9_-]+", "_", asesor or "asesor").strip("_")
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_dir = path_obj.parent / "backups_ave"
+        backup_dir.mkdir(exist_ok=True)
+        backup_path = backup_dir / f"backup_{path_obj.stem}_{stamp}_{safe_asesor}.xlsx"
+        backup_path.write_bytes(path_obj.read_bytes())
+
+    path_obj.write_bytes(export_db_excel(db))
+    return str(path_obj), str(backup_path) if backup_path else None
 
 
-def sync_db_to_gsheet(db: Dict[str, pd.DataFrame], spreadsheet_url: str, json_bytes: Optional[bytes] = None) -> str:
-    """Sobrescribe Google Sheets con la base actual de la app."""
-    sh, service_email = open_gsheet(spreadsheet_url, json_bytes)
-    existing = {ws.title: ws for ws in sh.worksheets()}
-    for name, cols in SHEETS.items():
-        if name not in existing:
-            ws = sh.add_worksheet(title=name, rows=max(100, 1), cols=max(len(cols), 5))
-        else:
-            ws = existing[name]
-        df = db.get(name, pd.DataFrame(columns=cols)).copy()
-        for col in cols:
-            if col not in df.columns:
-                df[col] = np.nan
-        df = df[cols].replace({np.nan: "", None: ""})
-        values = [cols] + df.astype(str).values.tolist()
-        ws.clear()
-        if values:
-            ws.update("A1", values)
-    return service_email
+def add_control_version(db: Dict[str, pd.DataFrame], asesor: str, curso: str, accion: str) -> Dict[str, pd.DataFrame]:
+    """Registra en Configuracion una línea simple de control operativo.
+    La hoja Configuracion sigue siendo de dos columnas para que sea fácil de entender.
+    """
+    registro = {
+        "parametro": f"ultima_actualizacion_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        "valor": f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {accion} | asesor={asesor} | curso={curso}"
+    }
+    return append_rows(db, "Configuracion", [registro])
 
 # -----------------------------------------------------------------------------
 # Session state init
@@ -676,7 +619,7 @@ semana_analisis = st.sidebar.selectbox("Semana de análisis", [1, 2, 3, 4, 5], i
 curso_manual = st.sidebar.text_input("Nombre del curso", value="Curso AVE")
 
 st.title(APP_NAME)
-st.caption("Clasificación de riesgo, historial académico, mensajes preventivos y derivaciones a bienestar con base de datos en Excel/Google Sheets.")
+st.caption("Clasificación de riesgo, historial académico, mensajes preventivos y derivaciones a bienestar con base de datos en Excel local o sincronizado.")
 
 tabs = st.tabs(["🏠 Inicio", "🗂️ Base de datos", "🔌 Canvas / Datos", "📊 Dashboard", "👤 Estudiante", "✉️ Mensajes", "📌 Derivaciones", "⬇️ Exportar"])
 
@@ -697,76 +640,92 @@ with tabs[0]:
 # Base de datos
 # -----------------------------------------------------------------------------
 with tabs[1]:
-    st.markdown("### Cargar base de datos")
-    uploaded_db = st.file_uploader("Cargar Excel de base de datos", type=["xlsx"], key="db_upload")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if st.button("Usar Excel cargado", type="primary"):
-            st.session_state.db = load_excel_db(uploaded_db)
-            st.success("Base de datos cargada correctamente.")
-    with col_b:
-        if st.button("Crear base vacía"):
-            st.session_state.db = empty_db()
-            st.success("Base vacía creada en memoria.")
+    st.markdown("### Base de datos institucional en Excel")
+    st.info(
+        "La app puede trabajar con un Excel cargado manualmente o con un archivo Excel ubicado en una carpeta sincronizada de OneDrive, SharePoint o Google Drive. "
+        "El modo de ruta local funciona cuando la app se ejecuta en la computadora del asesor o en un servidor que tenga acceso a esa carpeta sincronizada."
+    )
 
-    with st.expander("Conectar Google Sheets opcional", expanded=True):
-        st.info(
-            "Para conectar Google Sheets se necesita una cuenta de servicio de Google Cloud. "
-            "Subí el JSON y compartí la hoja con el correo `client_email` que viene dentro del JSON, con permiso de Editor."
+    modo_bd = st.radio(
+        "Método de trabajo",
+        ["Cargar Excel manualmente", "Usar Excel desde ruta local / OneDrive / SharePoint sincronizado", "Crear base nueva"],
+        horizontal=False,
+    )
+
+    if modo_bd == "Cargar Excel manualmente":
+        uploaded_db = st.file_uploader("Cargar archivo Excel de base de datos", type=["xlsx"], key="db_upload")
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("Leer Excel cargado", type="primary"):
+                try:
+                    st.session_state.db = load_excel_db(uploaded_db)
+                    st.session_state.db = add_control_version(st.session_state.db, asesor_academico, curso_manual, "Lectura de Excel cargado")
+                    st.success("Base de datos cargada correctamente.")
+                except Exception as e:
+                    st.error(f"No se pudo leer el Excel: {e}")
+        with col_b:
+            st.download_button(
+                "Descargar base actualizada",
+                data=export_db_excel(st.session_state.db),
+                file_name=f"base_datos_seguimiento_ave_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+    elif modo_bd == "Usar Excel desde ruta local / OneDrive / SharePoint sincronizado":
+        st.markdown("#### Ruta del archivo sincronizado")
+        st.caption("Ejemplo Windows: C:/Users/Usuario/Universidad del Valle de Guatemala/AVE/base_datos_seguimiento_ave.xlsx")
+        excel_path = st.text_input("Ruta completa del Excel institucional", key="excel_sync_path")
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button("Probar acceso"):
+                try:
+                    path_obj = Path(excel_path.strip().strip('\"'))
+                    if path_obj.exists():
+                        st.success(f"Archivo encontrado: {path_obj.name}")
+                        st.caption(f"Última modificación detectada: {datetime.fromtimestamp(path_obj.stat().st_mtime).strftime('%Y-%m-%d %H:%M:%S')}")
+                    else:
+                        st.error("No se encontró el archivo en esa ruta.")
+                except Exception as e:
+                    st.error(f"No se pudo validar la ruta: {e}")
+        with c2:
+            if st.button("Leer base institucional", type="primary"):
+                try:
+                    st.session_state.db = load_excel_db_from_path(excel_path)
+                    st.session_state.db = add_control_version(st.session_state.db, asesor_academico, curso_manual, "Lectura desde ruta sincronizada")
+                    st.success("Base institucional leída correctamente.")
+                except Exception as e:
+                    st.error(f"No se pudo leer la base: {e}")
+        with c3:
+            if st.button("Guardar cambios en Excel"):
+                try:
+                    st.session_state.db = add_control_version(st.session_state.db, asesor_academico, curso_manual, "Guardado en ruta sincronizada")
+                    saved_path, backup_path = save_db_to_excel_path(st.session_state.db, excel_path, asesor_academico, make_backup=True)
+                    st.success(f"Base guardada correctamente en: {saved_path}")
+                    if backup_path:
+                        st.caption(f"Respaldo creado: {backup_path}")
+                except Exception as e:
+                    st.error(f"No se pudo guardar la base: {e}")
+
+        st.warning(
+            "Para evitar conflictos, no dejés el Excel abierto mientras la app guarda cambios. "
+            "Si varios asesores usan la misma base, conviene guardar por turnos o trabajar con respaldos."
         )
-        gs_url = st.text_input("URL de Google Sheets", placeholder="https://docs.google.com/spreadsheets/d/.../edit")
-        gs_json = st.file_uploader("Credenciales JSON de cuenta de servicio", type=["json"], key="gs_json")
 
-        json_bytes = gs_json.getvalue() if gs_json is not None else None
+    else:
+        if st.button("Crear base vacía", type="primary"):
+            st.session_state.db = empty_db()
+            st.session_state.db = add_control_version(st.session_state.db, asesor_academico, curso_manual, "Creación de base nueva")
+            st.success("Base vacía creada en memoria.")
+        st.download_button(
+            "Descargar plantilla Excel vacía",
+            data=export_db_excel(empty_db()),
+            file_name="base_datos_seguimiento_ave_template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
-        if gs_json is not None:
-            try:
-                import json
-                service_email_preview = json.loads(json_bytes.decode("utf-8")).get("client_email", "")
-                if service_email_preview:
-                    st.caption(f"Correo de la cuenta de servicio: {service_email_preview}")
-                    st.warning("Antes de leer o guardar, compartí el Google Sheets con este correo como Editor.")
-            except Exception:
-                st.warning("El archivo JSON no parece tener el formato esperado de cuenta de servicio.")
-
-        cgs1, cgs2, cgs3 = st.columns(3)
-        with cgs1:
-            if st.button("Probar conexión"):
-                try:
-                    sh, service_email = open_gsheet(gs_url, json_bytes)
-                    st.success(f"Conexión correcta con: {sh.title}")
-                    if service_email:
-                        st.caption(f"Cuenta usada: {service_email}")
-                except Exception as e:
-                    st.error(str(e))
-        with cgs2:
-            if st.button("Inicializar estructura"):
-                try:
-                    service_email = init_gsheet(gs_url, json_bytes)
-                    st.success("Se crearon/verificaron las pestañas y encabezados necesarios.")
-                    if service_email:
-                        st.caption(f"Cuenta usada: {service_email}")
-                except Exception as e:
-                    st.error(str(e))
-        with cgs3:
-            if st.button("Leer Google Sheets"):
-                try:
-                    st.session_state.db = read_gsheet(gs_url, json_bytes)
-                    st.success("Google Sheets leído correctamente.")
-                except Exception as e:
-                    st.error(str(e))
-
-        if st.button("Guardar base actual en Google Sheets", type="primary"):
-            try:
-                service_email = sync_db_to_gsheet(st.session_state.db, gs_url, json_bytes)
-                st.success("Base actual guardada en Google Sheets correctamente.")
-                if service_email:
-                    st.caption(f"Cuenta usada: {service_email}")
-            except Exception as e:
-                st.error(str(e))
-
-    st.markdown("### Hojas detectadas")
-    selected_sheet = st.selectbox("Vista previa", list(SHEETS.keys()))
+    st.markdown("### Vista previa de la base actual")
+    selected_sheet = st.selectbox("Hoja para revisar", list(SHEETS.keys()))
     st.dataframe(st.session_state.db.get(selected_sheet, pd.DataFrame()), use_container_width=True, height=320)
 
 # -----------------------------------------------------------------------------
