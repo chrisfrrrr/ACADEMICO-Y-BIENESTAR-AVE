@@ -149,12 +149,56 @@ class CanvasClient:
             return False, str(e)
 
     def courses(self) -> pd.DataFrame:
-        data = self._get_paginated("/courses", {"enrollment_state": "active"})
-        return pd.DataFrame([{"id": c.get("id"), "name": c.get("name"), "course_code": c.get("course_code")} for c in data])
+        """Devuelve los cursos a los que el token tiene acceso.
+        La API de Canvas responde únicamente con los cursos visibles para el usuario del token.
+        """
+        data = self._get_paginated("/courses", {"enrollment_state": "active", "include[]": ["term", "total_students"]})
+        rows = []
+        for c in data:
+            if not c.get("id") or not c.get("name"):
+                continue
+            term = c.get("term") or {}
+            rows.append({
+                "id": c.get("id"),
+                "name": c.get("name"),
+                "course_code": c.get("course_code"),
+                "term": term.get("name"),
+                "total_students": c.get("total_students"),
+                "workflow_state": c.get("workflow_state"),
+            })
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            df["label"] = df.apply(lambda r: f"{r.get('name','')} | ID: {r.get('id','')}" + (f" | {r.get('course_code')}" if pd.notna(r.get('course_code')) and str(r.get('course_code')).strip() else ""), axis=1)
+        return df
 
     def users(self, course_id: str) -> pd.DataFrame:
         data = self._get_paginated(f"/courses/{course_id}/users", {"enrollment_type[]": "student"})
         return pd.DataFrame([{"canvas_user_id": u.get("id"), "nombre": u.get("name"), "correo": u.get("email"), "login_id": u.get("login_id")} for u in data])
+
+    def enrollments(self, course_id: str) -> pd.DataFrame:
+        """Obtiene estudiantes con calificación y actividad cuando Canvas lo permite."""
+        data = self._get_paginated(
+            f"/courses/{course_id}/enrollments",
+            {"type[]": "StudentEnrollment", "state[]": "active", "include[]": ["user", "grades"]}
+        )
+        rows = []
+        for e in data:
+            u = e.get("user") or {}
+            grades = e.get("grades") or {}
+            current_score = grades.get("current_score")
+            final_score = grades.get("final_score")
+            last_activity_at = e.get("last_activity_at")
+            rows.append({
+                "canvas_user_id": e.get("user_id") or u.get("id"),
+                "carne": u.get("sis_user_id") or u.get("integration_id") or u.get("login_id"),
+                "nombre": u.get("name"),
+                "correo": u.get("email") or u.get("login_id"),
+                "login_id": u.get("login_id"),
+                "promedio": current_score if current_score is not None else final_score,
+                "last_activity_at": last_activity_at,
+                "total_activity_time": e.get("total_activity_time"),
+            })
+        return pd.DataFrame(rows)
 
     def assignments(self, course_id: str) -> pd.DataFrame:
         data = self._get_paginated(f"/courses/{course_id}/assignments", {"include[]": ["submission"]})
@@ -170,6 +214,84 @@ class CanvasClient:
             u = s.get("user") or {}
             rows.append({"assignment_id": assignment_id, "canvas_user_id": s.get("user_id"), "nombre": u.get("name"), "submitted_at": s.get("submitted_at"), "late": s.get("late"), "missing": s.get("missing"), "score": s.get("score"), "workflow_state": s.get("workflow_state")})
         return pd.DataFrame(rows)
+
+    def course_metrics(self, course_id: str, course_name: str = "") -> pd.DataFrame:
+        """Construye una tabla de seguimiento desde Canvas.
+        Intenta leer matrícula, calificaciones, actividades publicadas y entregas.
+        Si Canvas no entrega una métrica, se deja como NaN; la lógica de riesgo la tratará como alerta.
+        """
+        base = self.enrollments(course_id)
+        if base.empty:
+            base = self.users(course_id)
+        if base.empty:
+            return base
+
+        # Actividad reciente: Canvas suele entregar last_activity_at en enrollments.
+        if "last_activity_at" in base.columns:
+            today = pd.Timestamp.now(tz=None)
+            la = pd.to_datetime(base["last_activity_at"], errors="coerce", utc=True).dt.tz_convert(None)
+            base["dias_inactivo"] = (today.normalize() - la.dt.normalize()).dt.days
+            # Estimación conservadora de ingresos semanales cuando no existe conteo real.
+            base["ingresos_semana"] = np.select(
+                [base["dias_inactivo"].le(2), base["dias_inactivo"].between(3, 6), base["dias_inactivo"].ge(7)],
+                [3, 1, 0],
+                default=np.nan
+            )
+        else:
+            base["dias_inactivo"] = np.nan
+            base["ingresos_semana"] = np.nan
+
+        try:
+            acts = self.assignments(course_id)
+            if not acts.empty:
+                acts = acts[acts.get("published", True).fillna(True)].copy()
+                # Se toman actividades vencidas o sin fecha de cierre visible; evita contar tareas futuras contra el estudiante.
+                if "due_at" in acts.columns:
+                    due = pd.to_datetime(acts["due_at"], errors="coerce", utc=True)
+                    acts = acts[due.isna() | (due <= pd.Timestamp.utcnow())]
+                assignment_ids = acts["assignment_id"].dropna().astype(str).tolist()
+            else:
+                assignment_ids = []
+
+            subs_all = []
+            progress = st.progress(0, text="Leyendo actividades y entregas desde Canvas...") if assignment_ids else None
+            for idx, aid in enumerate(assignment_ids):
+                try:
+                    subs_all.append(self.submissions(course_id, aid))
+                except Exception:
+                    # Si una tarea no se puede leer, se continúa con las demás.
+                    pass
+                if progress:
+                    progress.progress((idx + 1) / max(len(assignment_ids), 1), text=f"Leyendo entregas {idx+1}/{len(assignment_ids)}")
+            if progress:
+                progress.empty()
+
+            total_actividades = len(assignment_ids)
+            if subs_all and total_actividades > 0:
+                subs = pd.concat(subs_all, ignore_index=True)
+                subs["submitted_flag"] = subs["submitted_at"].notna() | subs["workflow_state"].astype(str).isin(["submitted", "graded"])
+                resumen = subs.groupby("canvas_user_id").agg(
+                    actividades_entregadas=("submitted_flag", "sum"),
+                    entregas_tarde=("late", lambda x: int(pd.Series(x).fillna(False).sum())),
+                    entregas_faltantes=("missing", lambda x: int(pd.Series(x).fillna(False).sum())),
+                ).reset_index()
+                resumen["actividades_pct"] = (resumen["actividades_entregadas"] / total_actividades * 100).round(2)
+                resumen["entregas_tarde"] = resumen["entregas_tarde"] + resumen["entregas_faltantes"]
+                base = base.merge(resumen[["canvas_user_id", "actividades_pct", "entregas_tarde"]], on="canvas_user_id", how="left")
+                base["actividades_pct"] = base["actividades_pct"].fillna(0)
+                base["entregas_tarde"] = base["entregas_tarde"].fillna(total_actividades)
+            else:
+                base["actividades_pct"] = np.nan
+                base["entregas_tarde"] = np.nan
+        except Exception as e:
+            st.warning(f"Canvas no permitió calcular actividades/entregas automáticamente: {e}")
+            base["actividades_pct"] = np.nan
+            base["entregas_tarde"] = np.nan
+
+        base["semanas_sin_entregas"] = np.nan
+        base["horas_respuesta"] = np.nan
+        base["curso"] = course_name
+        return base
 
     def send_message(self, recipients: List[str], subject: str, body: str) -> Tuple[bool, str]:
         payload = {"recipients[]": recipients, "subject": subject, "body": body, "force_new": True}
@@ -196,33 +318,79 @@ def classify_student(row: pd.Series) -> Tuple[str, str]:
 
     high_flags = 0
     mod_flags = 0
-    if pd.notna(pct):
-        if pct < 50: high_flags += 1; motivos.append("bajo cumplimiento de actividades semanales")
-        elif pct < 80: mod_flags += 1; motivos.append("cumplimiento parcial de actividades")
-    if pd.notna(prom):
-        if prom < 59: high_flags += 1; motivos.append("promedio inferior al mínimo esperado")
-        elif prom < 70: mod_flags += 1; motivos.append("promedio académico en rango de alerta")
-    if pd.notna(tarde):
-        if tarde >= 4: high_flags += 1; motivos.append("entregas pendientes o tardías recurrentes")
-        elif tarde >= 2: mod_flags += 1; motivos.append("entregas irregulares o tardías")
+    missing_core = 0
+
+    # Criterio crítico: si no existe evidencia de avance académico en Canvas,
+    # NO debe clasificarse como bajo. Se asume alerta alta por ausencia de evidencia.
+    core_values = [pct, prom, tarde, ingresos, inactivo]
+    if all(pd.isna(v) for v in core_values):
+        return "Alto", "sin evidencia disponible de avance, calificación, entregas o actividad en Canvas"
+
+    if pd.isna(pct):
+        missing_core += 1
+        motivos.append("sin dato de porcentaje de actividades")
+    else:
+        if pct < 50:
+            high_flags += 1; motivos.append("bajo cumplimiento de actividades semanales")
+        elif pct < 80:
+            mod_flags += 1; motivos.append("cumplimiento parcial de actividades")
+
+    if pd.isna(prom):
+        missing_core += 1
+        motivos.append("sin dato de promedio en Canvas")
+    else:
+        if prom < 59:
+            high_flags += 1; motivos.append("promedio inferior al mínimo esperado")
+        elif prom < 70:
+            mod_flags += 1; motivos.append("promedio académico en rango de alerta")
+
+    if pd.isna(tarde):
+        missing_core += 1
+        motivos.append("sin dato de entregas tardías o pendientes")
+    else:
+        if tarde >= 4:
+            high_flags += 1; motivos.append("entregas pendientes o tardías recurrentes")
+        elif tarde >= 2:
+            mod_flags += 1; motivos.append("entregas irregulares o tardías")
+
     if pd.notna(sin_ent) and sin_ent >= 2:
         high_flags += 1; motivos.append("sin entregas por dos o más semanas")
-    if pd.notna(ingresos):
-        if ingresos == 0: high_flags += 1; motivos.append("sin ingresos semanales a Canvas")
-        elif ingresos <= 2: mod_flags += 1; motivos.append("baja frecuencia de ingreso a Canvas")
-    if pd.notna(inactivo):
-        if inactivo >= 6: high_flags += 1; motivos.append("inactividad total en Canvas por seis o más días")
-        elif inactivo >= 3: mod_flags += 1; motivos.append("actividad limitada en Canvas")
-    if pd.notna(horas_resp):
-        if horas_resp >= 120: high_flags += 1; motivos.append("no responde comunicaciones por cinco o más días")
-        elif horas_resp >= 48: mod_flags += 1; motivos.append("responde comunicaciones con retraso")
 
-    if high_flags >= 1 and (high_flags + mod_flags) >= 2:
+    if pd.isna(ingresos):
+        missing_core += 1
+        motivos.append("sin dato de ingresos semanales a Canvas")
+    else:
+        if ingresos == 0:
+            high_flags += 1; motivos.append("sin ingresos semanales a Canvas")
+        elif ingresos <= 2:
+            mod_flags += 1; motivos.append("baja frecuencia de ingreso a Canvas")
+
+    if pd.notna(inactivo):
+        if inactivo >= 6:
+            high_flags += 1; motivos.append("inactividad total en Canvas por seis o más días")
+        elif inactivo >= 3:
+            mod_flags += 1; motivos.append("actividad limitada en Canvas")
+
+    if pd.notna(horas_resp):
+        if horas_resp >= 120:
+            high_flags += 1; motivos.append("no responde comunicaciones por cinco o más días")
+        elif horas_resp >= 48:
+            mod_flags += 1; motivos.append("responde comunicaciones con retraso")
+
+    # Reglas de decisión más estrictas:
+    # - Un indicador crítico alto + otra alerta/moderada => Alto.
+    # - Dos indicadores críticos altos => Alto.
+    # - Varios datos ausentes también suben la alerta, porque no existe evidencia suficiente para bajo.
+    if high_flags >= 2 or (high_flags >= 1 and (mod_flags >= 1 or missing_core >= 2)):
         return "Alto", ", ".join(dict.fromkeys(motivos)) or "riesgo académico alto"
-    if high_flags >= 2:
-        return "Alto", ", ".join(dict.fromkeys(motivos)) or "riesgo académico alto"
-    if mod_flags >= 1 or high_flags == 1:
+    if high_flags == 1:
         return "Moderado", ", ".join(dict.fromkeys(motivos)) or "señales académicas de alerta"
+    if mod_flags >= 2 or (mod_flags >= 1 and missing_core >= 1):
+        return "Moderado", ", ".join(dict.fromkeys(motivos)) or "señales académicas de alerta"
+    if missing_core >= 3:
+        return "Alto", ", ".join(dict.fromkeys(motivos)) or "información insuficiente para validar avance"
+    if missing_core >= 1:
+        return "Moderado", ", ".join(dict.fromkeys(motivos)) or "información parcial; requiere verificación"
     return "Bajo", "desempeño académico estable"
 
 
@@ -345,23 +513,118 @@ def standardize_analysis_input(df: pd.DataFrame, db: Dict[str, pd.DataFrame], cu
 # -----------------------------------------------------------------------------
 # Google Sheets optional
 # -----------------------------------------------------------------------------
-def read_gsheet(spreadsheet_url: str, json_bytes: bytes) -> Dict[str, pd.DataFrame]:
+def get_gspread_client(json_bytes: Optional[bytes] = None):
+    """Crea cliente de Google Sheets usando JSON subido o st.secrets.
+    En Streamlit Cloud se puede configurar [gcp_service_account] en secrets.toml.
+    """
     if gspread is None or Credentials is None:
-        raise RuntimeError("gspread/google-auth no están instalados.")
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+        raise RuntimeError("Faltan dependencias. Instalá gspread y google-auth desde requirements.txt.")
     import json
-    creds = Credentials.from_service_account_info(json.loads(json_bytes.decode("utf-8")), scopes=scopes)
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_url(spreadsheet_url)
-    db = empty_db()
-    for name in SHEETS:
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    info = None
+    if json_bytes:
+        info = json.loads(json_bytes.decode("utf-8"))
+    else:
         try:
-            ws = sh.worksheet(name)
-            records = ws.get_all_records()
-            db[name] = normalize_cols(pd.DataFrame(records)) if records else pd.DataFrame(columns=SHEETS[name])
+            if "gcp_service_account" in st.secrets:
+                info = dict(st.secrets["gcp_service_account"])
         except Exception:
-            pass
+            info = None
+
+    if not info:
+        raise ValueError("Subí el archivo JSON de la cuenta de servicio o configurá gcp_service_account en st.secrets.")
+
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return gspread.authorize(creds), info.get("client_email", "")
+
+
+def open_gsheet(spreadsheet_url: str, json_bytes: Optional[bytes] = None):
+    if not spreadsheet_url or not spreadsheet_url.strip():
+        raise ValueError("Ingresá la URL completa de Google Sheets.")
+    gc, service_email = get_gspread_client(json_bytes)
+    try:
+        sh = gc.open_by_url(spreadsheet_url.strip())
+    except Exception as e:
+        raise RuntimeError(
+            "No se pudo abrir el Google Sheets. Verificá que la hoja esté compartida con el correo de la cuenta de servicio "
+            f"({service_email}) con permiso de Editor. Detalle: {e}"
+        )
+    return sh, service_email
+
+
+def worksheet_to_dataframe(ws, expected_cols: List[str]) -> pd.DataFrame:
+    values = ws.get_all_values()
+    if not values:
+        return pd.DataFrame(columns=expected_cols)
+    headers = [str(h).strip() for h in values[0]]
+    if not any(headers):
+        return pd.DataFrame(columns=expected_cols)
+    data = values[1:]
+    # Ajusta filas con longitud irregular para evitar errores de DataFrame.
+    width = len(headers)
+    data = [(row + [""] * width)[:width] for row in data]
+    df = pd.DataFrame(data, columns=headers)
+    df = normalize_cols(df)
+    for col in expected_cols:
+        if col not in df.columns:
+            df[col] = np.nan
+    return df[expected_cols]
+
+
+def read_gsheet(spreadsheet_url: str, json_bytes: Optional[bytes] = None) -> Dict[str, pd.DataFrame]:
+    sh, _ = open_gsheet(spreadsheet_url, json_bytes)
+    db = empty_db()
+    existing = {ws.title: ws for ws in sh.worksheets()}
+    for name, cols in SHEETS.items():
+        if name in existing:
+            db[name] = worksheet_to_dataframe(existing[name], cols)
+        else:
+            # No falla si falta una hoja; solo la crea en memoria vacía.
+            db[name] = pd.DataFrame(columns=cols)
     return db
+
+
+def init_gsheet(spreadsheet_url: str, json_bytes: Optional[bytes] = None) -> str:
+    """Crea las pestañas requeridas y sus encabezados si no existen."""
+    sh, service_email = open_gsheet(spreadsheet_url, json_bytes)
+    existing = {ws.title: ws for ws in sh.worksheets()}
+    for name, cols in SHEETS.items():
+        if name in existing:
+            ws = existing[name]
+            values = ws.get_all_values()
+            if not values or not any(values[0]):
+                ws.update("A1", [cols])
+        else:
+            rows = max(100, 10)
+            cols_count = max(len(cols), 5)
+            ws = sh.add_worksheet(title=name, rows=rows, cols=cols_count)
+            ws.update("A1", [cols])
+    return service_email
+
+
+def sync_db_to_gsheet(db: Dict[str, pd.DataFrame], spreadsheet_url: str, json_bytes: Optional[bytes] = None) -> str:
+    """Sobrescribe Google Sheets con la base actual de la app."""
+    sh, service_email = open_gsheet(spreadsheet_url, json_bytes)
+    existing = {ws.title: ws for ws in sh.worksheets()}
+    for name, cols in SHEETS.items():
+        if name not in existing:
+            ws = sh.add_worksheet(title=name, rows=max(100, 1), cols=max(len(cols), 5))
+        else:
+            ws = existing[name]
+        df = db.get(name, pd.DataFrame(columns=cols)).copy()
+        for col in cols:
+            if col not in df.columns:
+                df[col] = np.nan
+        df = df[cols].replace({np.nan: "", None: ""})
+        values = [cols] + df.astype(str).values.tolist()
+        ws.clear()
+        if values:
+            ws.update("A1", values)
+    return service_email
 
 # -----------------------------------------------------------------------------
 # Session state init
@@ -372,6 +635,12 @@ if "analysis_df" not in st.session_state:
     st.session_state.analysis_df = pd.DataFrame()
 if "canvas_client" not in st.session_state:
     st.session_state.canvas_client = None
+if "canvas_courses" not in st.session_state:
+    st.session_state.canvas_courses = pd.DataFrame()
+if "selected_canvas_course_id" not in st.session_state:
+    st.session_state.selected_canvas_course_id = ""
+if "selected_canvas_course_name" not in st.session_state:
+    st.session_state.selected_canvas_course_name = ""
 
 # -----------------------------------------------------------------------------
 # Sidebar configuration
@@ -418,15 +687,61 @@ with tabs[1]:
             st.session_state.db = empty_db()
             st.success("Base vacía creada en memoria.")
 
-    with st.expander("Conectar Google Sheets opcional"):
-        gs_url = st.text_input("URL de Google Sheets")
+    with st.expander("Conectar Google Sheets opcional", expanded=True):
+        st.info(
+            "Para conectar Google Sheets se necesita una cuenta de servicio de Google Cloud. "
+            "Subí el JSON y compartí la hoja con el correo `client_email` que viene dentro del JSON, con permiso de Editor."
+        )
+        gs_url = st.text_input("URL de Google Sheets", placeholder="https://docs.google.com/spreadsheets/d/.../edit")
         gs_json = st.file_uploader("Credenciales JSON de cuenta de servicio", type=["json"], key="gs_json")
-        if st.button("Leer Google Sheets"):
+
+        json_bytes = gs_json.getvalue() if gs_json is not None else None
+
+        if gs_json is not None:
             try:
-                st.session_state.db = read_gsheet(gs_url, gs_json.getvalue())
-                st.success("Google Sheets leído correctamente.")
+                import json
+                service_email_preview = json.loads(json_bytes.decode("utf-8")).get("client_email", "")
+                if service_email_preview:
+                    st.caption(f"Correo de la cuenta de servicio: {service_email_preview}")
+                    st.warning("Antes de leer o guardar, compartí el Google Sheets con este correo como Editor.")
+            except Exception:
+                st.warning("El archivo JSON no parece tener el formato esperado de cuenta de servicio.")
+
+        cgs1, cgs2, cgs3 = st.columns(3)
+        with cgs1:
+            if st.button("Probar conexión"):
+                try:
+                    sh, service_email = open_gsheet(gs_url, json_bytes)
+                    st.success(f"Conexión correcta con: {sh.title}")
+                    if service_email:
+                        st.caption(f"Cuenta usada: {service_email}")
+                except Exception as e:
+                    st.error(str(e))
+        with cgs2:
+            if st.button("Inicializar estructura"):
+                try:
+                    service_email = init_gsheet(gs_url, json_bytes)
+                    st.success("Se crearon/verificaron las pestañas y encabezados necesarios.")
+                    if service_email:
+                        st.caption(f"Cuenta usada: {service_email}")
+                except Exception as e:
+                    st.error(str(e))
+        with cgs3:
+            if st.button("Leer Google Sheets"):
+                try:
+                    st.session_state.db = read_gsheet(gs_url, json_bytes)
+                    st.success("Google Sheets leído correctamente.")
+                except Exception as e:
+                    st.error(str(e))
+
+        if st.button("Guardar base actual en Google Sheets", type="primary"):
+            try:
+                service_email = sync_db_to_gsheet(st.session_state.db, gs_url, json_bytes)
+                st.success("Base actual guardada en Google Sheets correctamente.")
+                if service_email:
+                    st.caption(f"Cuenta usada: {service_email}")
             except Exception as e:
-                st.error(f"No se pudo leer Google Sheets: {e}")
+                st.error(str(e))
 
     st.markdown("### Hojas detectadas")
     selected_sheet = st.selectbox("Vista previa", list(SHEETS.keys()))
@@ -439,21 +754,65 @@ with tabs[2]:
     st.markdown("### Conexión con Canvas")
     url = st.text_input("URL de Canvas", placeholder="https://uvg.instructure.com")
     token = st.text_input("Token de Canvas", type="password")
-    col1, col2 = st.columns([1, 2])
+    col1, col2, col3 = st.columns([1, 1, 2])
     with col1:
         if st.button("Validar token"):
-            try:
-                client = CanvasClient(url, token)
-                ok, msg = client.validate()
-                if ok:
-                    st.session_state.canvas_client = client
-                    st.success(f"Conexión validada: {msg}")
-                else:
-                    st.error(msg)
-            except Exception as e:
-                st.error(str(e))
+            if not url or not token:
+                st.warning("Ingresá la URL de Canvas y el token antes de validar.")
+            else:
+                try:
+                    client = CanvasClient(url, token)
+                    ok, msg = client.validate()
+                    if ok:
+                        st.session_state.canvas_client = client
+                        st.success(f"Conexión validada: {msg}")
+                    else:
+                        st.error(msg)
+                except Exception as e:
+                    st.error(str(e))
     with col2:
-        st.info("La extracción depende de permisos del token. Si alguna métrica no está disponible, use la carga manual de reporte.")
+        if st.button("Cargar cursos"):
+            if not url or not token:
+                st.warning("Ingresá la URL de Canvas y el token antes de cargar cursos.")
+            else:
+                try:
+                    client = st.session_state.canvas_client or CanvasClient(url, token)
+                    ok, msg = client.validate()
+                    if not ok:
+                        st.error(msg)
+                    else:
+                        st.session_state.canvas_client = client
+                        cursos = client.courses()
+                        st.session_state.canvas_courses = cursos
+                        if cursos.empty:
+                            st.warning("El token fue validado, pero Canvas no devolvió cursos activos para este usuario.")
+                        else:
+                            st.success(f"Se encontraron {len(cursos)} cursos disponibles.")
+                except Exception as e:
+                    st.error(f"No se pudieron cargar los cursos: {e}")
+    with col3:
+        st.info("Primero valide el token y luego cargue los cursos. La lista mostrará únicamente los cursos a los que el token tenga acceso.")
+
+    cursos_df = st.session_state.canvas_courses.copy()
+    selected_course_id = st.session_state.selected_canvas_course_id
+    selected_course_name = st.session_state.selected_canvas_course_name or curso_manual
+    if not cursos_df.empty:
+        labels = cursos_df["label"].tolist() if "label" in cursos_df.columns else cursos_df["name"].astype(str).tolist()
+        default_index = 0
+        if selected_course_id:
+            match = cursos_df.index[cursos_df["id"].astype(str).eq(str(selected_course_id))].tolist()
+            if match:
+                default_index = int(match[0])
+        selected_label = st.selectbox("Seleccione el curso de Canvas a analizar", labels, index=default_index)
+        selected_row = cursos_df.loc[(cursos_df["label"] if "label" in cursos_df.columns else cursos_df["name"].astype(str)).eq(selected_label)].iloc[0]
+        selected_course_id = str(selected_row["id"])
+        selected_course_name = str(selected_row["name"])
+        st.session_state.selected_canvas_course_id = selected_course_id
+        st.session_state.selected_canvas_course_name = selected_course_name
+        st.caption(f"Curso seleccionado: {selected_course_name} | ID Canvas: {selected_course_id}")
+        st.dataframe(cursos_df.drop(columns=["label"], errors="ignore"), use_container_width=True, height=180)
+    else:
+        st.warning("Aún no hay cursos cargados. Usá el botón **Cargar cursos** para obtenerlos desde Canvas.")
 
     st.markdown("### Cargar reporte manual")
     report_file = st.file_uploader("Cargar reporte CSV o Excel con columnas de indicadores", type=["csv", "xlsx"], key="report")
@@ -465,7 +824,8 @@ with tabs[2]:
         st.write("Vista previa del reporte cargado")
         st.dataframe(raw.head(20), use_container_width=True)
         if st.button("Ejecutar análisis con reporte cargado", type="primary"):
-            analyzed = standardize_analysis_input(raw, st.session_state.db, curso_manual, semana_analisis, asesor_academico)
+            curso_analisis = st.session_state.selected_canvas_course_name or curso_manual
+            analyzed = standardize_analysis_input(raw, st.session_state.db, curso_analisis, semana_analisis, asesor_academico)
             st.session_state.analysis_df = analyzed
             idc = datetime.now().strftime("C%Y%m%d%H%M%S")
             rows = []
@@ -474,22 +834,40 @@ with tabs[2]:
                 rows.append(d)
             append_rows(st.session_state.db, "Historial_Estudiantes", rows)
             counts = analyzed["riesgo"].value_counts().to_dict()
-            append_rows(st.session_state.db, "Consultas_Canvas", [{"id_consulta": idc, "fecha_consulta": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "asesor_academico": asesor_academico, "curso": curso_manual, "semana": semana_analisis, "total_estudiantes": len(analyzed), "bajo": counts.get("Bajo", 0), "moderado": counts.get("Moderado", 0), "alto": counts.get("Alto", 0), "fuente_datos": "reporte manual"}])
+            append_rows(st.session_state.db, "Consultas_Canvas", [{"id_consulta": idc, "fecha_consulta": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "asesor_academico": asesor_academico, "curso": (st.session_state.selected_canvas_course_name or curso_manual), "semana": semana_analisis, "total_estudiantes": len(analyzed), "bajo": counts.get("Bajo", 0), "moderado": counts.get("Moderado", 0), "alto": counts.get("Alto", 0), "fuente_datos": "reporte manual"}])
             st.success("Análisis ejecutado y registrado en historial.")
 
-    with st.expander("Extracción básica desde Canvas"):
-        course_id = st.text_input("ID del curso Canvas")
-        if st.button("Obtener estudiantes del curso"):
-            try:
-                client = st.session_state.canvas_client or CanvasClient(url, token)
-                users = client.users(course_id)
-                users["curso"] = curso_manual
-                users["actividades_pct"] = np.nan; users["promedio"] = np.nan; users["entregas_tarde"] = np.nan; users["semanas_sin_entregas"] = np.nan; users["ingresos_semana"] = np.nan; users["dias_inactivo"] = np.nan; users["horas_respuesta"] = np.nan
-                st.session_state.analysis_df = standardize_analysis_input(users, st.session_state.db, curso_manual, semana_analisis, asesor_academico)
-                st.success("Estudiantes obtenidos. Complete métricas faltantes con reporte manual si Canvas no las expone.")
-                st.dataframe(st.session_state.analysis_df, use_container_width=True)
-            except Exception as e:
-                st.error(f"No se pudo obtener información: {e}")
+    with st.expander("Extracción básica desde Canvas", expanded=True):
+        course_id = st.session_state.selected_canvas_course_id
+        course_name = st.session_state.selected_canvas_course_name or curso_manual
+        if course_id:
+            st.success(f"Curso listo para consultar: {course_name} | ID: {course_id}")
+        else:
+            st.warning("Primero cargá y seleccioná un curso de Canvas. También podés escribir el ID manualmente si ya lo conocés.")
+            course_id = st.text_input("ID del curso Canvas", value="")
+            course_name = curso_manual
+
+        if st.button("Obtener estudiantes del curso seleccionado"):
+            if not course_id:
+                st.warning("Seleccioná un curso o ingresá manualmente el ID del curso Canvas.")
+            else:
+                try:
+                    client = st.session_state.canvas_client or CanvasClient(url, token)
+                    users = client.course_metrics(course_id, course_name)
+                    analyzed = standardize_analysis_input(users, st.session_state.db, course_name, semana_analisis, asesor_academico)
+                    st.session_state.analysis_df = analyzed
+                    idc = datetime.now().strftime("C%Y%m%d%H%M%S")
+                    rows = []
+                    for _, r in analyzed.iterrows():
+                        d = r.to_dict(); d["fecha"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S"); d["id_consulta"] = idc
+                        rows.append(d)
+                    append_rows(st.session_state.db, "Historial_Estudiantes", rows)
+                    counts = analyzed["riesgo"].value_counts().to_dict()
+                    append_rows(st.session_state.db, "Consultas_Canvas", [{"id_consulta": idc, "fecha_consulta": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "asesor_academico": asesor_academico, "curso": course_name, "semana": semana_analisis, "total_estudiantes": len(analyzed), "bajo": counts.get("Bajo", 0), "moderado": counts.get("Moderado", 0), "alto": counts.get("Alto", 0), "fuente_datos": "Canvas API"}])
+                    st.success("Análisis ejecutado desde Canvas y registrado en historial. Si Canvas no expone algún dato, la app lo toma como alerta para evitar falsos riesgos bajos.")
+                    st.dataframe(st.session_state.analysis_df, use_container_width=True)
+                except Exception as e:
+                    st.error(f"No se pudo obtener información: {e}")
 
 # -----------------------------------------------------------------------------
 # Dashboard
